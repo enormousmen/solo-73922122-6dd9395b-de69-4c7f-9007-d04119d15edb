@@ -6,9 +6,12 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      REPLICA_DIR: /replica
     volumes:
       - backup-data:/data
+      - backup-replica:/replica
     restart: unless-stopped
 
 volumes:
   backup-data:
+  backup-replica:

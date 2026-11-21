@@ -55,9 +55,19 @@
 </section>
 
 <section>
-  <h2>2. 快照链</h2>
-  <p class="hint">“撤除”会删除该快照并把其块合并进直接子层（缺块才继承，全零块算改写），其余层不动；任一快照都可下载还原后的原始镜像。</p>
+  <h2>2. 快照链（源卷）</h2>
+  <p class="hint">“撤除”会删除该快照并把其块合并进直接子层（缺块才继承，全零块算改写），其余层不动；任一快照都可下载还原后的原始镜像。“同步到备用卷”会把该恢复点及全部祖先层按原父子关系复制到 <b>/replica</b>，同一来源 epoch 再同步另一分支时自动复用已复制层。</p>
   <div id="tree">尚未导入清单。</div>
+</section>
+
+<section id="replicaSection">
+  <h2>3. 备用卷副本（/replica）</h2>
+  <div class="bar" id="replicaStatus">加载中…</div>
+  <div id="replicaRecovery" hidden style="margin-top:8px">
+    <ul id="replicaRecoveryList" style="color:#b9832a"></ul>
+  </div>
+  <p class="hint" style="margin-top:8px">每条已提交的同步链都可下载链上任意恢复点；同步失败或进程重启后，备用卷只呈现同步前或完整的新链，不会出现半成品。</p>
+  <div id="replicaChains">备用卷尚无副本。</div>
 </section>
 
 <section>
@@ -111,7 +121,58 @@ async function refresh() {
   } else rec.hidden = true;
 
   renderTree(st);
+  await refreshReplica();
   return st;
+}
+
+async function refreshReplica() {
+  const rs = await api("/api/replica/state");
+  $("replicaStatus").innerHTML = rs.initialized
+    ? `<span>状态：<b class="ok">已有副本</b></span>
+       <span>盘大小：<b>${fmtSize(rs.disk_size)}</b></span>
+       <span>同步链：<b>${rs.chains.length}</b></span>
+       <span>去重后层文件：<b>${rs.layer_file_count}</b></span>
+       <span class="meta">卷路径 ${rs.path}</span>`
+    : `<span>状态：<b>尚无副本</b><span class="meta">（卷路径 ${rs.path}）</span></span>`;
+
+  const rec = $("replicaRecovery");
+  if (rs.recovery_events && rs.recovery_events.length) {
+    rec.hidden = false;
+    $("replicaRecoveryList").innerHTML =
+      rs.recovery_events.map(e => `<li>${e}</li>`).join("");
+  } else rec.hidden = true;
+
+  const host = $("replicaChains");
+  if (!rs.initialized || !rs.chains.length) {
+    host.textContent = "备用卷尚无副本。在上方快照链点“同步到备用卷”开始。";
+    return;
+  }
+  host.innerHTML = rs.chains.map(ch => {
+    const epoch = ch.source_epoch.slice(0, 8);
+    const rows = ch.layers.map(l => `
+      <li><b>${l.id}</b>
+        <span class="meta">${l.blocks} 块${l.parent ? `，父层 ${l.parent}` : "，基盘（根层）"}</span>
+        <button class="ghost" data-rdl="${ch.sync_id}|${l.id}">下载副本镜像</button>
+        ${l.id === ch.target ? '<span class="tag">同步入口</span>' : ""}
+      </li>`).join("");
+    return `<div style="margin:10px 0;padding:8px 12px;border-left:3px solid #2e9e4f55;background:#8881;border-radius:6px">
+      <div class="bar">
+        <span>同步 <b>${ch.sync_id.slice(0, 8)}</b></span>
+        <span class="meta">来源 epoch ${epoch}</span>
+        <span class="meta">目标恢复点 <b>${ch.target}</b></span>
+        <span class="meta">${ch.layer_count} 层</span>
+        <span class="meta">${ch.synced_at.replace("+00:00", "Z")}</span>
+      </div>
+      <ul class="tree" style="margin-top:6px">${rows}</ul>
+    </div>`;
+  }).join("");
+
+  host.querySelectorAll("[data-rdl]").forEach(btn =>
+    btn.addEventListener("click", () => {
+      const [syncId, id] = btn.getAttribute("data-rdl").split("|");
+      log(`从备用卷下载 ${id} 的副本镜像 …`);
+      window.location = `/api/replica/download/${encodeURIComponent(syncId)}/${encodeURIComponent(id)}`;
+    }));
 }
 
 function renderTree(st) {
@@ -127,6 +188,7 @@ function renderTree(st) {
       : `<button disabled title="${l.parent === null ? "基盘（根层）不能撤除" : "没有子层，不可撤除"}">撤除</button>`;
     return `<li><b>${l.id}</b><span class="meta">${l.block_count} 块</span>
       <button class="ghost" data-download="${l.id}">下载镜像</button>
+      <button data-sync="${l.id}">同步到备用卷</button>
       ${removeBtn}
       ${l.parent === null ? '<span class="tag">基盘</span>' : ""}
       ${kids ? `<ul>${kids}</ul>` : ""}</li>`;
@@ -148,6 +210,17 @@ function renderTree(st) {
         log(st2.message || `已撤除 ${id}`);
         await refresh();
       } catch (e) { log(`撤除失败：${e.message}`, true); }
+    }));
+  host.querySelectorAll("[data-sync]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-sync");
+      btn.disabled = true;
+      try {
+        const rs = await api(`/api/replica/sync/${encodeURIComponent(id)}`, { method: "POST" });
+        log(rs.message || `已同步 ${id} 到备用卷`);
+        await refreshReplica();
+      } catch (e) { log(`同步失败：${e.message}`, true); }
+      finally { btn.disabled = false; }
     }));
 }
 

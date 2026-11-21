@@ -13,7 +13,8 @@ from tests.conftest import make_manifest
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(create_app(str(tmp_path)))
+    return TestClient(create_app(str(tmp_path / "data"),
+                                 str(tmp_path / "replica")))
 
 
 class TestPages:
@@ -114,3 +115,77 @@ class TestApiErrors:
 
     def test_remove_before_import_400(self, client):
         assert client.post("/api/remove/x").status_code == 400
+
+
+class TestReplicaApi:
+    def test_replica_state_initially_empty(self, client):
+        rs = client.get("/api/replica/state").json()
+        assert rs["initialized"] is False
+        assert rs["chains"] == []
+
+    def test_sync_then_download_every_point(self, client):
+        sample = build_sample_manifest()
+        client.post("/api/import", json=sample)
+        before = {lid: client.get(f"/api/download/{lid}").content
+                  for lid in ["base", "snap-1", "snap-2", "snap-3", "snap-4"]}
+
+        resp = client.post("/api/replica/sync/snap-4")  # 链 base,snap-1,snap-2,snap-4
+        assert resp.status_code == 200
+        st = resp.json()
+        assert st["copied_layers"] == 4 and st["reused_layers"] == 0
+        chain = st["chains"][0]
+        assert chain["target"] == "snap-4"
+        assert [l["id"] for l in chain["layers"]] == [
+            "base", "snap-1", "snap-2", "snap-4"]
+        assert st["layer_file_count"] == 4
+
+        sync_id = chain["sync_id"]
+        # 链上每个恢复点都能从备用卷下载，字节与源卷一致
+        for lid in ["base", "snap-1", "snap-2", "snap-4"]:
+            r = client.get(f"/api/replica/download/{sync_id}/{lid}")
+            assert r.status_code == 200
+            assert r.headers["content-type"] == "application/octet-stream"
+            assert "attachment" in r.headers["content-disposition"]
+            assert r.content == before[lid]
+
+    def test_second_branch_reuses_layers(self, client):
+        client.post("/api/import", json=build_sample_manifest())
+        client.post("/api/replica/sync/snap-4")
+        resp = client.post("/api/replica/sync/snap-3")  # 共享 base、snap-1
+        st = resp.json()
+        assert st["copied_layers"] == 1 and st["reused_layers"] == 2
+        assert len(st["chains"]) == 2
+        # 去重后层文件：4（第一条链）+ 1（snap-3）
+        assert st["layer_file_count"] == 5
+        # 两条链引用的 base 是同一个物理文件
+        f1 = st["chains"][0]["layers"][0]["file"]
+        f2 = st["chains"][1]["layers"][0]["file"]
+        assert f1 == f2
+
+    def test_idempotent_resync(self, client):
+        client.post("/api/import", json=build_sample_manifest())
+        client.post("/api/replica/sync/snap-3")
+        again = client.post("/api/replica/sync/snap-3").json()
+        assert again["copied_layers"] == 0
+        assert len(again["chains"]) == 1
+
+    def test_replica_download_unknown_404(self, client):
+        client.post("/api/import", json=build_sample_manifest())
+        assert client.get("/api/replica/download/nope/snap-3").status_code == 404
+
+    def test_sync_unknown_point_404(self, client):
+        client.post("/api/import", json=build_sample_manifest())
+        assert client.post("/api/replica/sync/ghost").status_code == 404
+
+    def test_sync_before_import_400(self, client):
+        assert client.post("/api/replica/sync/base").status_code == 400
+
+    def test_source_still_downloadable_after_sync(self, client):
+        sample = build_sample_manifest()
+        client.post("/api/import", json=sample)
+        src_before = client.get("/api/download/snap-4").content
+        client.post("/api/replica/sync/snap-4")
+        assert client.get("/api/download/snap-4").content == src_before
+        # 同步不影响源卷撤除等原有操作
+        r = client.post("/api/remove/snap-2")
+        assert r.status_code == 200

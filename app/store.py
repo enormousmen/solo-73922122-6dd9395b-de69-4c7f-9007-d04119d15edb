@@ -414,6 +414,50 @@ class Store:
             pass
 
     # ------------------------------------------------------------------ #
+    # 副本同步支持
+    # ------------------------------------------------------------------ #
+    def snapshot_chain(self, layer_id: str) -> dict:
+        """在源卷锁内导出某恢复点及其全部祖先层的一致快照。
+
+        返回 chain（根 -> 目标的层 id 序）、每层元数据与层文件的原始字节，
+        副本引擎据此逐字节复制，全程不修改源卷；持锁期间源卷的撤除/导入被串行化。
+        """
+        with self._lock:
+            manifest = self._require_manifest()
+            layers = manifest["layers"]
+            if layer_id not in layers:
+                raise NotFoundError(f"快照 {layer_id} 不存在")
+            chain: list[str] = []
+            cur: str | None = layer_id
+            while cur is not None:
+                chain.append(cur)
+                cur = layers[cur]["parent"]
+            chain.reverse()  # 根 -> 目标
+            payloads: dict[str, bytes] = {}
+            for lid in chain:
+                name = layers[lid]["file"]
+                try:
+                    payloads[lid] = (self.layers_dir / name).read_bytes()
+                except FileNotFoundError as exc:
+                    raise CorruptStoreError(f"源层文件丢失：{name}") from exc
+                except OSError as exc:
+                    raise StoreError(f"读取源层文件失败：{name}: {exc}") from exc
+            return {
+                "source_epoch": manifest["epoch"],
+                "disk_size": manifest["disk_size"],
+                "chain": chain,
+                "layers": {
+                    lid: {
+                        "parent": layers[lid]["parent"],
+                        "file": layers[lid]["file"],
+                        "blocks": layers[lid]["blocks"],
+                    }
+                    for lid in chain
+                },
+                "payloads": payloads,
+            }
+
+    # ------------------------------------------------------------------ #
     # 查询 / 下载
     # ------------------------------------------------------------------ #
     def _require_manifest(self) -> dict:
